@@ -6,8 +6,9 @@ COverviewPassElement::COverviewPassElement() {
     ;
 }
 
-void COverviewPassElement::draw(const CRegion& damage) {
+std::vector<UP<IPassElement>> COverviewPassElement::draw() {
     g_pOverview->fullRender();
+    return {};
 }
 
 bool COverviewPassElement::needsLiveBlur() {
@@ -16,6 +17,14 @@ bool COverviewPassElement::needsLiveBlur() {
 
 bool COverviewPassElement::needsPrecomputeBlur() {
     return false;
+}
+
+const char* COverviewPassElement::passName() {
+    return "COverviewPassElement";
+}
+
+ePassElementType COverviewPassElement::type() {
+    return EK_CUSTOM;
 }
 
 std::optional<CBox> COverviewPassElement::boundingBox() {

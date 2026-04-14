@@ -10,7 +10,15 @@
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/managers/input/trackpad/GestureTypes.hpp>
 #include <hyprland/src/managers/input/trackpad/TrackpadGestures.hpp>
-#include <hyprland/src/managers/LayoutManager.hpp>
+#include <hyprland/src/layout/LayoutManager.hpp>
+#include <hyprland/src/layout/space/Space.hpp>
+#include <hyprland/src/layout/algorithm/TiledAlgorithm.hpp>
+#include <hyprland/src/layout/supplementary/WorkspaceAlgoMatcher.hpp>
+#include <hyprland/src/layout/algorithm/Algorithm.hpp>
+#include <hyprland/src/event/EventBus.hpp>
+#include <hyprland/src/config/ConfigManager.hpp>
+
+using namespace Config;
 
 #include <hyprutils/string/ConstVarList.hpp>
 using namespace Hyprutils::String;
@@ -69,7 +77,15 @@ static void hkAddDamageB(void* thisptr, const pixman_region32_t* rg) {
 
 static SDispatchResult onExpoDispatcher(std::string arg) {
 
-    IS_SCROLLING = g_pLayoutManager->getCurrentLayout()->getLayoutName() == "scrolling";
+    const auto PMODE = (Hyprlang::STRING const*)HyprlandAPI::getConfigValue(PHANDLE, "plugin:hyprexpo:mode")->getDataStaticPtr();
+    if (*PMODE == "grid")
+        IS_SCROLLING = false;
+    else if (*PMODE == "scrolling")
+        IS_SCROLLING = true;
+    else {
+        const auto PW = Desktop::focusState()->monitor()->m_activeWorkspace;
+        IS_SCROLLING  = Layout::Supplementary::algoMatcher()->getNameForTiledAlgo(&typeid(*PW->m_space->algorithm()->tiledAlgo())) == "scrolling";
+    }
 
     if (g_pOverview && g_pOverview->m_isSwiping)
         return {.success = false, .error = "already swiping"};
@@ -176,9 +192,9 @@ static Hyprlang::CParseResult expoGestureKeyword(const char* LHS, const char* RH
     std::expected<void, std::string> resultFromGesture;
 
     if (data[startDataIdx] == "expo")
-        resultFromGesture = g_pTrackpadGestures->addGesture(makeUnique<CExpoGesture>(), fingerCount, direction, modMask, deltaScale);
+        resultFromGesture = g_pTrackpadGestures->addGesture(makeUnique<CExpoGesture>(), fingerCount, direction, modMask, deltaScale, false);
     else if (data[startDataIdx] == "unset")
-        resultFromGesture = g_pTrackpadGestures->removeGesture(fingerCount, direction, modMask, deltaScale);
+        resultFromGesture = g_pTrackpadGestures->removeGesture(fingerCount, direction, modMask, deltaScale, false);
     else {
         result.setError(std::format("Invalid gesture: {}", data[startDataIdx]).c_str());
         return result;
@@ -236,7 +252,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("[he] Failed initializing hooks");
     }
 
-    static auto P = HyprlandAPI::registerCallbackDynamic(PHANDLE, "preRender", [](void* self, SCallbackInfo& info, std::any param) {
+    static CHyprSignalListener P = Event::bus()->m_events.render.pre.listen([](PHLMONITOR pMonitor) {
         if (!g_pOverview)
             return;
         g_pOverview->onPreRender();
@@ -246,11 +262,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     HyprlandAPI::addConfigKeyword(PHANDLE, "hyprexpo-gesture", ::expoGestureKeyword, {});
 
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:columns", Hyprlang::INT{3});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:gap_size", Hyprlang::INT{5});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:bg_col", Hyprlang::INT{0xFF111111});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:workspace_method", Hyprlang::STRING{"center current"});
-    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:skip_empty", Hyprlang::INT{0});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:mode", Hyprlang::STRING{"auto"});
+
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:grid:columns", Hyprlang::INT{3});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:grid:gap_size", Hyprlang::INT{5});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:grid:bg_col", Hyprlang::INT{0xFF111111});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:grid:workspace_method", Hyprlang::STRING{"center current"});
+    HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:grid:skip_empty", Hyprlang::INT{0});
     HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:scrolling:scroll_moves_up_down", Hyprlang::INT{1});
     HyprlandAPI::addConfigValue(PHANDLE, "plugin:hyprexpo:scrolling:default_zoom", Hyprlang::FLOAT{0.5});
 
@@ -266,5 +284,5 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     g_unloading = true;
 
-    g_pConfigManager->reload(); // we need to reload now to clear all the gestures
+    Config::mgr()->reload(); // we need to reload now to clear all the gestures
 }

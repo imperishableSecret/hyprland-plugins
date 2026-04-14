@@ -6,9 +6,11 @@
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/helpers/AnimatedVariable.hpp>
-#include <hyprland/src/managers/HookSystemManager.hpp>
+#include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/signal/Signal.hpp>
 #include <vector>
+
+using namespace Render;
 
 #include "IOverview.hpp"
 
@@ -48,7 +50,7 @@ class CScrollOverview : public IOverview {
 
     struct SWindowImage {
         PHLWINDOWREF            pWindow;
-        CFramebuffer            fb;
+        SP<IFramebuffer>        fb;
         bool                    highlight = false;
         UP<CHyprSignalListener> windowCommit;
         Vector2D                lastWindowPosition, lastWindowSize;
@@ -62,8 +64,8 @@ class CScrollOverview : public IOverview {
         std::vector<SP<SWindowImage>> windowImages;
     };
 
-    CFramebuffer                     backgroundFb;
-    CFramebuffer                     floatingFb;
+    SP<IFramebuffer>                 backgroundFb;
+    SP<IFramebuffer>                 floatingFb;
 
     Vector2D                         lastMousePosLocal = Vector2D{};
 
@@ -79,12 +81,12 @@ class CScrollOverview : public IOverview {
 
     bool                             closing = false;
 
-    SP<HOOK_CALLBACK_FN>             mouseMoveHook;
-    SP<HOOK_CALLBACK_FN>             mouseButtonHook;
-    SP<HOOK_CALLBACK_FN>             touchMoveHook;
-    SP<HOOK_CALLBACK_FN>             touchDownHook;
-    SP<HOOK_CALLBACK_FN>             mouseAxisHook;
-    SP<HOOK_CALLBACK_FN>             windowOpenHook;
+    CHyprSignalListener             mouseMoveHook;
+    CHyprSignalListener             mouseButtonHook;
+    CHyprSignalListener             touchMoveHook;
+    CHyprSignalListener             touchDownHook;
+    CHyprSignalListener             mouseAxisHook;
+    CHyprSignalListener             windowOpenHook;
 
     bool                             swipe             = false;
     bool                             swipeWasCommenced = false;

@@ -1,19 +1,35 @@
 #include "scrollOverview.hpp"
 #include <any>
 #define private public
+#define protected public
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/OpenGL.hpp>
+#include <hyprland/src/render/pass/ClearPassElement.hpp>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/config/ConfigManager.hpp>
 #include <hyprland/src/managers/animation/AnimationManager.hpp>
 #include <hyprland/src/managers/animation/DesktopAnimationManager.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
-#include <hyprland/src/managers/LayoutManager.hpp>
+#include <hyprland/src/layout/LayoutManager.hpp>
+#include <hyprland/src/layout/supplementary/WorkspaceAlgoMatcher.hpp>
+#include <hyprland/src/layout/algorithm/Algorithm.hpp>
+#include <hyprland/src/config/shared/animation/AnimationTree.hpp>
 #include <hyprland/src/managers/cursor/CursorShapeOverrideController.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
+#include <hyprland/src/helpers/varlist/VarList.hpp>
 #undef private
+#undef protected
 #include "OverviewPassElement.hpp"
+
+using namespace Render;
+using namespace Render::GL;
+using namespace Hyprutils::String;
+using namespace Hyprutils::Math;
+using namespace Config;
+using namespace Event;
+using namespace Desktop;
 
 static void damageMonitor(WP<Hyprutils::Animation::CBaseAnimatedVariable> thisptr) {
     g_pOverview->damage();
@@ -24,10 +40,9 @@ static void removeOverview(WP<Hyprutils::Animation::CBaseAnimatedVariable> thisp
 }
 
 CScrollOverview::~CScrollOverview() {
-    g_pHyprRenderer->makeEGLCurrent();
+    g_pHyprOpenGL->makeEGLCurrent();
     images.clear(); // otherwise we get a vram leak
     Cursor::overrideController->unsetOverride(Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
-    g_pHyprOpenGL->markBlurDirtyForMonitor(pMonitor.lock());
 }
 
 CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_) : startedOn(startedOn_), swipe(swipe_) {
@@ -43,8 +58,8 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_) : started
 
     std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) { return a->pWorkspace->m_id < b->pWorkspace->m_id; });
 
-    g_pAnimationManager->createAnimation(1.F, scale, g_pConfigManager->getAnimationPropertyConfig("windowsMove"), AVARDAMAGE_NONE);
-    g_pAnimationManager->createAnimation({}, viewOffset, g_pConfigManager->getAnimationPropertyConfig("windowsMove"), AVARDAMAGE_NONE);
+    g_pAnimationManager->createAnimation(1.F, scale, Config::animationTree()->getAnimationPropertyConfig("windowsMove"), AVARDAMAGE_NONE);
+    g_pAnimationManager->createAnimation({}, viewOffset, Config::animationTree()->getAnimationPropertyConfig("windowsMove"), AVARDAMAGE_NONE);
 
     scale->setUpdateCallback(damageMonitor);
     viewOffset->setUpdateCallback(damageMonitor);
@@ -54,7 +69,7 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_) : started
 
     lastMousePosLocal = g_pInputManager->getMouseCoordsInternal() - pMonitor->m_position;
 
-    auto onCursorMove = [this](void* self, SCallbackInfo& info, std::any param) {
+    auto onCursorMove = [this](const Vector2D& P, SCallbackInfo& info) {
         if (closing)
             return;
 
@@ -64,7 +79,7 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_) : started
         //  highlightHoverDebug();
     };
 
-    auto onCursorSelect = [this](void* self, SCallbackInfo& info, std::any param) {
+    auto onCursorSelect = [this](const IPointer::SButtonEvent& e, SCallbackInfo& info) {
         if (closing)
             return;
 
@@ -75,14 +90,11 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_) : started
         close();
     };
 
-    auto onMouseAxis = [this](void* self, SCallbackInfo& info, std::any param) {
+    auto onMouseAxis = [this](const IPointer::SAxisEvent& e, SCallbackInfo& info) {
         if (closing)
             return;
 
         info.cancelled = true;
-
-        auto                data = std::any_cast<std::unordered_map<std::string, std::any>>(param);
-        auto                e    = std::any_cast<IPointer::SAxisEvent>(data["event"]);
 
         static auto* const* PZOOM = (Hyprlang::INT* const*)HyprlandAPI::getConfigValue(PHANDLE, "plugin:hyprexpo:scrolling:scroll_moves_up_down")->getDataStaticPtr();
 
@@ -93,21 +105,40 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_) : started
             moveViewportWorkspace(e.delta > 0);
     };
 
-    auto onWindowOpen = [this](void* self, SCallbackInfo& info, std::any param) {
+    auto onWindowOpen = [this](PHLWINDOW pWindow) {
         if (closing)
             return;
 
         redrawAll();
     };
 
-    mouseMoveHook = g_pHookSystem->hookDynamic("mouseMove", onCursorMove);
-    touchMoveHook = g_pHookSystem->hookDynamic("touchMove", onCursorMove);
-    mouseAxisHook = g_pHookSystem->hookDynamic("mouseAxis", onMouseAxis);
+    auto onTouchMotion = [this](const ITouch::SMotionEvent& e, SCallbackInfo& info) {
+        if (closing)
+            return;
 
-    mouseButtonHook = g_pHookSystem->hookDynamic("mouseButton", onCursorSelect);
-    touchDownHook   = g_pHookSystem->hookDynamic("touchDown", onCursorSelect);
+        info.cancelled    = true;
+        lastMousePosLocal = g_pInputManager->getMouseCoordsInternal() - pMonitor->m_position;
+    };
 
-    windowOpenHook = g_pHookSystem->hookDynamic("openWindow", onWindowOpen);
+    auto onTouchDown = [this](const ITouch::SDownEvent& e, SCallbackInfo& info) {
+        if (closing)
+            return;
+
+        info.cancelled = true;
+
+        selectHoveredWorkspace();
+
+        close();
+    };
+
+    mouseMoveHook = Event::bus()->m_events.input.mouse.move.listen(onCursorMove);
+    touchMoveHook = Event::bus()->m_events.input.touch.motion.listen(onTouchMotion);
+    mouseAxisHook = Event::bus()->m_events.input.mouse.axis.listen(onMouseAxis);
+
+    mouseButtonHook = Event::bus()->m_events.input.mouse.button.listen(onCursorSelect);
+    touchDownHook   = Event::bus()->m_events.input.touch.down.listen(onTouchDown);
+
+    windowOpenHook = Event::bus()->m_events.window.open.listen(onWindowOpen);
 
     Cursor::overrideController->setOverride("left_ptr", Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
 
@@ -234,7 +265,7 @@ void CScrollOverview::redrawWorkspace(PHLWORKSPACE workspace, bool forcelowres) 
 
     blockOverviewRendering = true;
 
-    g_pHyprRenderer->makeEGLCurrent();
+    g_pHyprOpenGL->makeEGLCurrent();
 
     auto image = imageForWorkspace(workspace);
 
@@ -253,7 +284,8 @@ void CScrollOverview::redrawWorkspace(PHLWORKSPACE workspace, bool forcelowres) 
     for (const auto& w : windows) {
         auto img     = image->windowImages.emplace_back(makeShared<SWindowImage>());
         img->pWindow = w;
-        img->fb.alloc(pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y, pMonitor->m_output->state->state().drmFormat);
+        img->fb      = g_pHyprRenderer->createFB();
+        img->fb->alloc(pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y, pMonitor->m_output->state->state().drmFormat);
         if (!w->m_isX11 && w->wlSurface()) {
             img->windowCommit = makeUnique<CHyprSignalListener>(w->wlSurface()->resource()->m_events.commit.listen([wk = WP<SWindowImage>{img}] {
                 if (!wk || !wk->pWindow)
@@ -278,13 +310,13 @@ void CScrollOverview::redrawWindowImage(SP<SWindowImage> img) {
         return;
 
     CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
-    g_pHyprRenderer->beginRender(pMonitor.lock(), fakeDamage, RENDER_MODE_FULL_FAKE, nullptr, &img->fb);
+    g_pHyprRenderer->beginRender(pMonitor.lock(), fakeDamage, RENDER_MODE_FULL_FAKE, nullptr, img->fb);
 
-    g_pHyprOpenGL->clear(CHyprColor{0, 0, 0, 0});
+    g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0, 0, 0, 0}});
 
     g_pHyprRenderer->renderWindow(img->pWindow.lock(), pMonitor.lock(), Time::steadyNow(), true, RENDER_PASS_ALL, true, true);
 
-    g_pHyprOpenGL->m_renderData.blockScreenShader = true;
+    g_pHyprRenderer->m_renderData.blockScreenShader = true;
     g_pHyprRenderer->endRender();
 
     img->lastWindowPosition = img->pWindow->m_realPosition->value();
@@ -298,26 +330,31 @@ void CScrollOverview::redrawAll(bool forcelowres) {
     }
 
     // redraw bg
-    if (backgroundFb.m_size != pMonitor->m_pixelSize) {
-        backgroundFb.release();
-        backgroundFb.alloc(pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y, pMonitor->m_output->state->state().drmFormat);
-        floatingFb.alloc(pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y, pMonitor->m_output->state->state().drmFormat);
+    if (!backgroundFb) {
+        backgroundFb = g_pHyprRenderer->createFB();
+        floatingFb   = g_pHyprRenderer->createFB();
+    }
+
+    if (backgroundFb->m_size != pMonitor->m_pixelSize) {
+        backgroundFb->release();
+        backgroundFb->alloc(pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y, pMonitor->m_output->state->state().drmFormat);
+        floatingFb->alloc(pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y, pMonitor->m_output->state->state().drmFormat);
     }
 
     CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
-    g_pHyprRenderer->beginRender(pMonitor.lock(), fakeDamage, RENDER_MODE_FULL_FAKE, nullptr, &backgroundFb);
+    g_pHyprRenderer->beginRender(pMonitor.lock(), fakeDamage, RENDER_MODE_FULL_FAKE, nullptr, backgroundFb);
 
-    g_pHyprOpenGL->clear(CHyprColor{0, 0, 0, 1.0});
+    g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0, 0, 0, 1.0}});
 
     g_pHyprRenderer->renderAllClientsForWorkspace(pMonitor.lock(), nullptr, Time::steadyNow());
 
-    g_pHyprOpenGL->m_renderData.blockScreenShader = true;
+    g_pHyprRenderer->m_renderData.blockScreenShader = true;
     g_pHyprRenderer->endRender();
 
     // render floating as well. For these, we disable decos to match tiled ones.
-    g_pHyprRenderer->beginRender(pMonitor.lock(), fakeDamage, RENDER_MODE_FULL_FAKE, nullptr, &floatingFb);
+    g_pHyprRenderer->beginRender(pMonitor.lock(), fakeDamage, RENDER_MODE_FULL_FAKE, nullptr, floatingFb);
 
-    g_pHyprOpenGL->clear(CHyprColor{0, 0, 0, 0});
+    g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0, 0, 0, 0}});
 
     for (const auto& w : g_pCompositor->m_windows) {
         if (!validMapped(w) || !w->m_isFloating || w->m_workspace != startedOn)
@@ -326,7 +363,7 @@ void CScrollOverview::redrawAll(bool forcelowres) {
         g_pHyprRenderer->renderWindow(w, pMonitor.lock(), Time::steadyNow(), false, RENDER_PASS_ALL);
     }
 
-    g_pHyprOpenGL->m_renderData.blockScreenShader = true;
+    g_pHyprRenderer->m_renderData.blockScreenShader = true;
     g_pHyprRenderer->endRender();
 }
 
@@ -356,7 +393,7 @@ void CScrollOverview::close() {
             pMonitor->changeWorkspace(closeOnWindow->m_workspace, true, true, true);
         }
 
-        Desktop::focusState()->fullWindowFocus(closeOnWindow.lock());
+        Desktop::focusState()->fullWindowFocus(closeOnWindow.lock(), FOCUS_REASON_OTHER);
 
         size_t activeIdx = 0;
         for (size_t i = 0; i < images.size(); ++i) {
@@ -423,13 +460,13 @@ void CScrollOverview::render() {
 
 void CScrollOverview::fullRender() {
 
-    g_pHyprOpenGL->clear(CHyprColor{0, 0, 0, 1});
+    g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0, 0, 0, 1}});
 
     CBox texbox = {{}, pMonitor->m_size};
     texbox.scale(pMonitor->m_scale);
     texbox.round();
     CRegion damage{0, 0, INT16_MAX, INT16_MAX};
-    g_pHyprOpenGL->renderTextureInternal(backgroundFb.getTexture(), texbox, {.damage = &damage, .a = 1.0});
+    g_pHyprOpenGL->renderTextureInternal(backgroundFb->getTexture(), texbox, {.damage = &damage, .a = 1.0});
 
     const auto VIEWPORT_CENTER = CBox{{}, pMonitor->m_size}.middle();
 
@@ -461,7 +498,7 @@ void CScrollOverview::fullRender() {
 
             texbox.scale(pMonitor->m_scale).round();
             CRegion damage{0, 0, INT16_MAX, INT16_MAX};
-            g_pHyprOpenGL->renderTextureInternal(img->fb.getTexture(), texbox, {.damage = &damage, .a = 1.0 * img->pWindow->m_alpha->value()});
+            g_pHyprOpenGL->renderTextureInternal(img->fb->getTexture(), texbox, {.damage = &damage, .a = 1.0 * img->pWindow->m_alpha->value()});
 
             if (img->highlight) {
                 CBox texbox2 = CBox{img->pWindow->m_realPosition->value(), img->pWindow->m_realSize->value()}
@@ -476,7 +513,7 @@ void CScrollOverview::fullRender() {
         floatbox.translate(-VIEWPORT_CENTER).scale(scale->value()).translate(VIEWPORT_CENTER).translate(-viewOffset->value() * scale->value());
         floatbox.translate({0.F, yoff});
         floatbox.scale(pMonitor->m_scale).round();
-        g_pHyprOpenGL->renderTextureInternal(floatingFb.getTexture(), floatbox, {.damage = &damage, .a = 1.0});
+        g_pHyprOpenGL->renderTextureInternal(floatingFb->getTexture(), floatbox, {.damage = &damage, .a = 1.0});
 
         yoff += pMonitor->m_size.y * scale->value();
 
